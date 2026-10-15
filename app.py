@@ -13,12 +13,12 @@ from firebase_admin import credentials, firestore
 # --------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")
 
-# 📌 特定のユーザーID（複数指定可能）
+# 📌 【設定】特定のユーザーID（複数指定可能・カンマ区切りなどで環境変数に設定）
 auth_env = os.getenv("AUTHORIZED_USER_IDS", "")
 if auth_env:
     AUTHORIZED_USER_IDS = {int(uid.strip()) for uid in auth_env.split(",") if uid.strip().isdigit()}
 else:
-    AUTHORIZED_USER_IDS = {1488072800278413500}  # ← ここに実際のDiscordユーザーIDを入力してください
+    AUTHORIZED_USER_IDS = {123456789012345678}  # ← ここに実際のDiscordユーザーIDを入力してください（複数指定可）
 
 # スパム検知用の一時メモリ: {user_id: [last_content, count]}
 message_spam_track = {}
@@ -54,7 +54,7 @@ except Exception as e:
     db = None
     print(f"⚠️ Firestoreクライアントの取得に失敗しました: {e}")
 
-# Firestoreから指定ユーザーのIP情報を取得するヘルパー関数
+# Firestoreから指定ユーザーのIP情報を安全に取得するヘルパー関数
 def get_user_ip_from_db(user_id: int) -> str:
     if not db:
         return "データベース未接続"
@@ -77,8 +77,8 @@ class MyBot(commands.Bot):
         print(f"✅ スラッシュコマンド同期完了: {len(synced)} 件")
 
 intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
+intents.message_content = True  # メッセージの内容を読むために必須
+intents.members = True          # メンバー情報を取得するために必須
 
 bot = MyBot(command_prefix="!", intents=intents)
 
@@ -88,7 +88,7 @@ async def on_ready():
     print(f"✅ Discord Bot 接続成功: {bot.user}")
     print("========================================")
 
-# 権限判定ヘルパー
+# 権限判定ヘルパー（管理者または特定ユーザーかどうか）
 def is_authorized_or_admin(member: discord.Member) -> bool:
     if not member:
         return False
@@ -103,12 +103,13 @@ def is_authorized_or_admin(member: discord.Member) -> bool:
 # --------------------------------------------------
 @bot.event
 async def on_message(message: discord.Message):
+    # ボット自身のメッセージやDMは無視
     if message.author.bot or not message.guild:
         return
 
     author = message.author
 
-    # 管理者、または特定のユーザーは自動BANの対象外
+    # 管理者、または特定のユーザーは自動BANの対象外（免除）
     if isinstance(author, discord.Member) and is_authorized_or_admin(author):
         await bot.process_commands(message)
         return
@@ -126,7 +127,7 @@ async def on_message(message: discord.Message):
         except discord.Forbidden:
             pass
 
-    # 2. 同じメッセージを4回連続で送った場合
+    # 2. 同じメッセージを4回連続で送った場合（KeyError対策済み）
     stripped_content = content.strip()
     if user_id in message_spam_track:
         last_content, count = message_spam_track[user_id]
@@ -136,7 +137,7 @@ async def on_message(message: discord.Message):
                 try:
                     ip = get_user_ip_from_db(user_id)
                     await message.guild.ban(author, reason=f"荒らし対策: 同一メッセージ連投 (IP: {ip})")
-                    del message_spam_track[user_id]
+                    message_spam_track.pop(user_id, None)  # 安全に削除
                     return
                 except discord.Forbidden:
                     pass
@@ -176,6 +177,7 @@ async def ipban_command(
     user2: discord.Member = None, 
     user3: discord.Member = None
 ):
+    # 執行者が管理者または特定ユーザーではない場合は拒否
     if not is_authorized_or_admin(interaction.user):
         await interaction.response.send_message("❌ あなたにはこのコマンドを実行する権限がありません。", ephemeral=True)
         return
@@ -186,6 +188,7 @@ async def ipban_command(
     failed_list = []
 
     for target in targets:
+        # 管理者や特定ユーザー自身を誤ってBANするのを保護
         if is_authorized_or_admin(target):
             failed_list.append(f"{target.name} (管理者・保護対象)")
             continue
