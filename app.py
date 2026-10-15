@@ -18,7 +18,7 @@ auth_env = os.getenv("AUTHORIZED_USER_IDS", "")
 if auth_env:
     AUTHORIZED_USER_IDS = {int(uid.strip()) for uid in auth_env.split(",") if uid.strip().isdigit()}
 else:
-    AUTHORIZED_USER_IDS = {123456789012345678}  # ← ここに実際のDiscordユーザーIDを入力してください
+    AUTHORIZED_USER_IDS = {1488072800278413500}  # ← ここに実際のDiscordユーザーIDを入力してください
 
 # スパム検知用の一時メモリ: {user_id: [last_content, count]}
 message_spam_track = {}
