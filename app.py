@@ -168,7 +168,7 @@ intents.moderation = True
 bot = SecurityBot(command_prefix="!", intents=intents, proxy=PROXY_URL)
 
 # ★1分ごとに監獄の対象者を処刑チャンネルでメンションし続けるループ
-@tasks.loop(minutes=1)
+@tasks.loop(seconds=1)
 async def execution_loop():
     if EXECUTION_CHANNEL_ID == 0 or not db:
         return
