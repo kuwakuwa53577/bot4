@@ -404,6 +404,33 @@ async def ipban_command(interaction: discord.Interaction, user1: discord.Member,
     await send_log(interaction.guild, "🔨 手動IPBAN実行", f"実行者: {interaction.user}\n対象者数: {len(banned_results)}人", color=0xFF0000)
 
 # --------------------------------------------------
+# 監獄から解放するスラッシュコマンド
+# --------------------------------------------------
+@bot.tree.command(name="unjail", description="指定したユーザーを監獄（処刑リスト）から解放します")
+@app_commands.describe(user="解放したいユーザー")
+@app_commands.default_permissions(administrator=True)
+async def unjail_command(interaction: discord.Interaction, user: discord.Member):
+    if not is_authorized_or_admin(interaction.user):
+        await interaction.response.send_message("❌ 権限がありません。", ephemeral=True)
+        return
+
+    if not db:
+        await interaction.response.send_message("❌ データベースに接続されていません。", ephemeral=True)
+        return
+
+    user_id_str = str(user.id)
+    doc_ref = db.collection("jail_list").document(user_id_str)
+    
+    # Firebaseからデータを削除
+    doc = doc_ref.get()
+    if doc.exists:
+        doc_ref.delete()
+        await interaction.response.send_message(f"✅ ユーザー {user.mention} を監獄から解放（釈放）しました！", ephemeral=True)
+        await send_log(interaction.guild, "🔓 監獄解放（釈放）実行", f"対象者: {user.mention} (`{user.id}`)\n実行者: {interaction.user}", color=0x00FF00)
+    else:
+        await interaction.response.send_message(f"⚠️ {user.mention} は監獄に入っていません。", ephemeral=True)
+
+# --------------------------------------------------
 # メイン実行
 # --------------------------------------------------
 if __name__ == "__main__":
