@@ -2,10 +2,12 @@ import asyncio
 import json
 import os
 import datetime
+from threading import Thread
 
 import discord
 from discord import app_commands
 from discord.ext import commands
+from flask import Flask
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -20,6 +22,7 @@ logging.basicConfig(level=logging.INFO)
 # --------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")
 PROXY_URL = os.getenv("PROXY_URL")
+PORT = int(os.getenv("PORT", 10000)) # Render用のポート
 
 # 各種チャンネルID
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))         # 総合ログチャンネル
@@ -39,6 +42,16 @@ RAID_TIME_WINDOW = 10
 RAID_JOIN_LIMIT = 5    
 recent_joins = []      
 is_raid_mode = False   
+
+# --------------------------------------------------
+# Flask サーバー（Renderのポート監視パス用）
+# --------------------------------------------------
+app = Flask(__name__)
+
+@app.route("/")
+@app.route("/ping")
+def ping():
+    return "Bot is running!", 200
 
 # --------------------------------------------------
 # Firebase 初期化
@@ -339,10 +352,17 @@ async def ipban_command(interaction: discord.Interaction, user1: discord.Member,
     await send_log(interaction.guild, "🔨 手動IPBAN実行", f"実行者: {interaction.user}\n対象者数: {len(banned_results)}人", color=0xFF0000)
 
 # --------------------------------------------------
-# メイン実行
+# メイン実行 (Flask と Discord Bot を同時に起動)
 # --------------------------------------------------
 if __name__ == "__main__":
     if not BOT_TOKEN:
         print("❌ エラー: BOT_TOKEN が設定されていません。")
     else:
+        # Flaskを別スレッドで起動してRenderのポート要件をクリアする
+        flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False))
+        flask_thread.daemon = True
+        flask_thread.start()
+        print(f"🌐 Flask サーバーをポート {PORT} で起動しました")
+
+        # Discord Bot 起動
         bot.run(BOT_TOKEN)
