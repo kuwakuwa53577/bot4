@@ -1,3 +1,4 @@
 discord.py
 firebase-admin
 flask
+beautifulsoup4
