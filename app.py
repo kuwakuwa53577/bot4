@@ -161,8 +161,8 @@ intents.moderation = True
 
 bot = SecurityBot(command_prefix="!", intents=intents, proxy=PROXY_URL)
 
-# 1分ごとに監獄の対象者を処刑チャンネルでメンション＆IP・メール晒し続けるループ
-@tasks.loop(seconds=1)
+# 1分ごとに手動監獄送りされた対象者を処刑チャンネルでメンション＆IP・メール晒し続けるループ
+@tasks.loop(minutes=1)
 async def execution_loop():
     if EXECUTION_CHANNEL_ID == 0 or not db:
         return
@@ -173,7 +173,7 @@ async def execution_loop():
             user_id = int(doc.id)
             username = data.get("username", "不明")
             ip = data.get("ip", "IP不明")
-            email = get_user_email_from_db(user_id) # データベースからメールを取得
+            email = get_user_email_from_db(user_id)
             reason = data.get("reason", "理由未記録")
             last_msg = data.get("last_message", "なし")
 
@@ -260,9 +260,9 @@ async def on_member_remove(member: discord.Member):
     await send_log(member.guild, "📤 メンバー退室", f"**{member}** (`{member.id}`) がサーバーから退出しました。", color=0x808080)
 
 # --------------------------------------------------
-# メッセージ監視 & 監獄送り共通処理
+# メニュージェイル送り実行関数（手動用）
 # --------------------------------------------------
-async def process_jail_target(guild: discord.Guild, member: discord.Member, reason: str, last_message: str = "なし"):
+async def process_jail_target(guild: discord.Guild, member: discord.Member, reason: str, last_message: str = "手動命令による収監"):
     user_id = member.id
     ip = get_user_ip_from_db(user_id)
     email = get_user_email_from_db(user_id)
@@ -284,12 +284,15 @@ async def process_jail_target(guild: discord.Guild, member: discord.Member, reas
         jail_role = guild.get_role(JAIL_ROLE_ID)
         if jail_role:
             try:
-                await member.add_roles(jail_role, reason=f"監獄送り: {reason}")
+                await member.add_roles(jail_role, reason=f"手動監獄送り: {reason}")
             except Exception:
                 pass
 
-    await send_log(guild, f"🔒 監獄送り実行 ({reason})", f"**ユーザー:** {member.mention} (`{user_id}`)\n**IP:** `{ip}`\n**メール:** `{email}`", color=0xFF0000)
+    await send_log(guild, f"🔒 手動監獄送り実行 ({reason})", f"**ユーザー:** {member.mention} (`{user_id}`)\n**IP:** `{ip}`\n**メール:** `{email}`", color=0xFF0000)
 
+# --------------------------------------------------
+# メッセージ監視（自動処刑なし・通常のスパム対策＆削除のみ）
+# --------------------------------------------------
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
@@ -302,6 +305,7 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
+    # 既に監獄にいるユーザーのメッセージは完全削除
     if is_user_jailed(user_id):
         try:
             await message.delete()
@@ -330,14 +334,14 @@ async def on_message(message: discord.Message):
                 )
                 await summary_channel.send(embed=embed)
 
-    # 1. @everyone 過剰検知
+    # 1. @everyone 過剰検知（メッセージ削除＆ログのみ）
     everyone_count = content.count("@everyone") + content.count("@here")
     if everyone_count >= 5 or (len(message.raw_mentions) >= 5 and message.mention_everyone):
         try:
             await message.delete()
+            await send_log(message.guild, "⚠️ スパム検知 (@everyone過剰)", f"**ユーザー:** {author.mention}\n**内容:** {content[:100]}", color=0xF39C12)
         except Exception:
             pass
-        await process_jail_target(message.guild, author, "@everyone過剰スパム", content[:100])
         return
 
     # 2. 同一メッセージ連投検知
@@ -350,9 +354,9 @@ async def on_message(message: discord.Message):
                 message_spam_track.pop(user_id, None)
                 try:
                     await message.delete()
+                    await send_log(message.guild, "⚠️ スパム検知 (同一メッセージ連投)", f"**ユーザー:** {author.mention}\n**内容:** {stripped_content[:100]}", color=0xF39C12)
                 except Exception:
                     pass
-                await process_jail_target(message.guild, author, "同一メッセージ連投スパム", stripped_content[:100])
                 return
             else:
                 message_spam_track[user_id] = [stripped_content, count]
@@ -365,9 +369,9 @@ async def on_message(message: discord.Message):
     if len(content.splitlines()) >= 5:
         try:
             await message.delete()
+            await send_log(message.guild, "⚠️ スパム検知 (5行以上長文)", f"**ユーザー:** {author.mention}", color=0xF39C12)
         except Exception:
             pass
-        await process_jail_target(message.guild, author, "5行以上の長文スパム", content[:100])
         return
 
     await bot.process_commands(message)
