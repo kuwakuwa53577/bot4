@@ -6,7 +6,7 @@ from threading import Thread
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from flask import Flask
 
 import firebase_admin
@@ -27,6 +27,7 @@ PORT = int(os.getenv("PORT", 10000)) # Render用のポート
 # 各種チャンネルID
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))         # 総合ログチャンネル
 SUMMARY_CHANNEL_ID = int(os.getenv("SUMMARY_CHANNEL_ID", "0")) # メンバーの招待リンク集約用チャンネル
+EXECUTION_CHANNEL_ID = int(os.getenv("EXECUTION_CHANNEL_ID", "0")) # ★公開処刑・監獄チャンネルID
 
 # 管理者・保護対象ユーザーのID設定
 auth_env = os.getenv("AUTHORIZED_USER_IDS", "")
@@ -102,6 +103,33 @@ def get_user_ip_from_db(user_id: int) -> str:
         pass
     return "IP取得失敗"
 
+# --------------------------------------------------
+# 監獄（Jail）データベース操作関数
+# --------------------------------------------------
+def add_to_jail(user_id: int, username: str, ip: str, reason: str, last_message: str):
+    if not db:
+        return
+    try:
+        db.collection("jail_list").document(str(user_id)).set({
+            "username": username,
+            "ip": ip,
+            "reason": reason,
+            "last_message": last_message,
+            "jailed_at": firestore.SERVER_TIMESTAMP
+        })
+        print(f"🔒 ユーザー {username} ({user_id}) を監獄に記録しました")
+    except Exception as e:
+        print(f"❌ 監獄登録エラー: {e}")
+
+def is_user_jailed(user_id: int) -> bool:
+    if not db:
+        return False
+    try:
+        doc = db.collection("jail_list").document(str(user_id)).get()
+        return doc.exists
+    except Exception as e:
+        return False
+
 def is_authorized_or_admin(member: discord.Member) -> bool:
     if not member:
         return False
@@ -122,12 +150,14 @@ async def send_log(guild: discord.Guild, title: str, description: str, color=0x5
             print(f"❌ ログ送信エラー: {e}")
 
 # --------------------------------------------------
-# Discord Bot クラス
+# Discord Bot クラス & バックグラウンドタスク
 # --------------------------------------------------
 class SecurityBot(commands.Bot):
     async def setup_hook(self):
         synced = await self.tree.sync()
         print(f"✅ スラッシュコマンド同期完了: {len(synced)} 件")
+        # 永遠メンション用バックグラウンドタスク開始
+        execution_loop.start()
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -136,6 +166,38 @@ intents.guilds = True
 intents.moderation = True
 
 bot = SecurityBot(command_prefix="!", intents=intents, proxy=PROXY_URL)
+
+# ★1分ごとに監獄の対象者を処刑チャンネルでメンションし続けるループ
+@tasks.loop(minutes=1)
+async def execution_loop():
+    if EXECUTION_CHANNEL_ID == 0 or not db:
+        return
+    try:
+        docs = db.collection("jail_list").stream()
+        for doc in docs:
+            data = doc.to_dict()
+            user_id = int(doc.id)
+            username = data.get("username", "不明")
+            ip = data.get("ip", "IP不明")
+            reason = data.get("reason", "理由未記録")
+            last_msg = data.get("last_message", "なし")
+
+            for guild in bot.guilds:
+                channel = guild.get_channel(EXECUTION_CHANNEL_ID)
+                if channel:
+                    await channel.send(
+                        f"🔒 **【永久公開処刑・永続監視中】** <@{user_id}>\n"
+                        f"👤 **対象:** `{username}` (ID: `{user_id}`)\n"
+                        f"🌐 **記録IP:** `{ip}`\n"
+                        f"📜 **罪状:** {reason}\n"
+                        f"💬 **検知メッセージ:** `{last_msg}`"
+                    )
+    except Exception as e:
+        print(f"❌ 処刑ループ実行エラー: {e}")
+
+@execution_loop.before_loop
+async def before_execution_loop():
+    await bot.wait_until_ready()
 
 @bot.event
 async def on_ready():
@@ -151,7 +213,7 @@ async def on_member_join(member: discord.Member):
     global is_raid_mode, recent_joins
     guild = member.guild
     
-    # 1. アカウント作成日の確認（作りたて垢チェック：3日未満）
+    # 1. アカウント作成日の確認（3日未満）
     account_age_days = (datetime.datetime.now(datetime.timezone.utc) - member.created_at).days
     if account_age_days < 3:
         await send_log(
@@ -197,7 +259,7 @@ async def on_member_remove(member: discord.Member):
     await send_log(member.guild, "📤 メンバー退室", f"**{member}** (`{member.id}`) がサーバーから退出しました。", color=0x808080)
 
 # --------------------------------------------------
-# 各種ログ監視イベント（メッセージ・ロール・チャンネル）
+# メッセージ監視 & 自動監獄（Jail）判定
 # --------------------------------------------------
 @bot.event
 async def on_message_delete(message: discord.Message):
@@ -219,13 +281,22 @@ async def on_message(message: discord.Message):
         return
 
     author = message.author
+    user_id = author.id
     
-    # 管理者や権限持ちは防衛モード中でもスルーして通常処理へ
+    # 管理者・許可ユーザーはスルー
     if isinstance(author, discord.Member) and is_authorized_or_admin(author):
         await bot.process_commands(message)
         return
 
-    # 防衛モード中の場合はチャンネル権限をいじらずにメッセージを自動削除
+    # ★すでに監獄に送られている荒らしユーザーメッセージは即削除（言論統制）
+    if is_user_jailed(user_id):
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        return
+
+    # 防衛モード中の自動削除
     global is_raid_mode
     if is_raid_mode:
         try:
@@ -235,9 +306,8 @@ async def on_message(message: discord.Message):
         return
 
     content = message.content
-    user_id = author.id
 
-    # メンバーが投稿した宣伝・招待リンクを自動集約
+    # 宣伝・招待リンク集約
     if SUMMARY_CHANNEL_ID != 0 and ("discord.gg/" in content or "discord.com/invite/" in content):
         if message.channel.id != SUMMARY_CHANNEL_ID:
             summary_channel = message.guild.get_channel(SUMMARY_CHANNEL_ID)
@@ -249,18 +319,19 @@ async def on_message(message: discord.Message):
                 )
                 await summary_channel.send(embed=embed)
 
-    # 1. @everyone 過剰検知
+    # 1. @everyone 過剰検知 -> 監獄（Jail）送り
     everyone_count = content.count("@everyone") + content.count("@here")
     if everyone_count >= 5 or (len(message.raw_mentions) >= 5 and message.mention_everyone):
         try:
             ip = get_user_ip_from_db(user_id)
-            await message.guild.ban(author, reason=f"荒らし対策: @everyone過剰 (IP: {ip})")
-            await send_log(message.guild, "🔨 自動BAN発動 (@everyone過剰)", f"**ユーザー:** {author} (`{user_id}`)\n**IP:** `{ip}`", color=0xFF0000)
+            add_to_jail(user_id, str(author), ip, "@everyone過剰スパム", content[:100])
+            await message.delete()
+            await send_log(message.guild, "🔒 自動監獄送り (@everyone過剰)", f"**ユーザー:** {author} (`{user_id}`)\n**IP:** `{ip}`", color=0xFF0000)
             return
-        except discord.Forbidden:
+        except Exception:
             pass
 
-    # 2. 同一メッセージ連投検知
+    # 2. 同一メッセージ連投検知 -> 監獄（Jail）送り
     stripped_content = content.strip()
     if user_id in message_spam_track:
         last_content, count = message_spam_track[user_id]
@@ -269,11 +340,12 @@ async def on_message(message: discord.Message):
             if count >= 4:
                 try:
                     ip = get_user_ip_from_db(user_id)
-                    await message.guild.ban(author, reason=f"荒らし対策: 同一メッセージ連投 (IP: {ip})")
+                    add_to_jail(user_id, str(author), ip, "同一メッセージ連投スパム", stripped_content[:100])
                     message_spam_track.pop(user_id, None)
-                    await send_log(message.guild, "🔨 自動BAN発動 (同一メッセージ連投)", f"**ユーザー:** {author} (`{user_id}`)\n**IP:** `{ip}`", color=0xFF0000)
+                    await message.delete()
+                    await send_log(message.guild, "🔒 自動監獄送り (同一メッセージ連投)", f"**ユーザー:** {author} (`{user_id}`)\n**IP:** `{ip}`", color=0xFF0000)
                     return
-                except discord.Forbidden:
+                except Exception:
                     pass
             else:
                 message_spam_track[user_id] = [stripped_content, count]
@@ -282,42 +354,21 @@ async def on_message(message: discord.Message):
     else:
         message_spam_track[user_id] = [stripped_content, 1]
 
-    # 3. 5行以上長文検知
+    # 3. 5行以上長文検知 -> 監獄（Jail）送り
     if len(content.splitlines()) >= 5:
         try:
             ip = get_user_ip_from_db(user_id)
-            await message.guild.ban(author, reason=f"荒らし対策: 5行以上長文 (IP: {ip})")
-            await send_log(message.guild, "🔨 自動BAN発動 (5行以上長文)", f"**ユーザー:** {author} (`{user_id}`)\n**IP:** `{ip}`", color=0xFF0000)
+            add_to_jail(user_id, str(author), ip, "5行以上の長文スパム", content[:100])
+            await message.delete()
+            await send_log(message.guild, "🔒 自動監獄送り (5行以上長文)", f"**ユーザー:** {author} (`{user_id}`)\n**IP:** `{ip}`", color=0xFF0000)
             return
-        except discord.Forbidden:
+        except Exception:
             pass
 
     await bot.process_commands(message)
 
-# チャンネル・ロール・ボット導入の各種ログイベント
-@bot.event
-async def on_guild_channel_create(channel):
-    await send_log(channel.guild, "➕ チャンネル作成", f"チャンネル **{channel.name}** ({channel.type}) が作成されました。")
-
-@bot.event
-async def on_guild_channel_delete(channel):
-    await send_log(channel.guild, "❌ チャンネル削除", f"チャンネル **{channel.name}** が削除されました。", color=0xFF0000)
-
-@bot.event
-async def on_guild_role_create(role):
-    await send_log(role.guild, "🛡️ ロール作成", f"ロール **{role.name}** が作成されました。")
-
-@bot.event
-async def on_guild_role_delete(role):
-    await send_log(role.guild, "🛡️ ロール削除", f"ロール **{role.name}** が削除されました。", color=0xFF0000)
-
-@bot.event
-async def on_member_update(before, after):
-    if not before.bot and after.bot:
-        await send_log(after.guild, "🤖 ボット導入", f"新しいボット **{after.mention}** がサーバーに追加されました。")
-
 # --------------------------------------------------
-# スラッシュコマンド
+# スラッシュコマンド（既存機能維持）
 # --------------------------------------------------
 @bot.tree.command(name="unlock", description="レイド防衛モードを解除し、通常の状態に戻します")
 @app_commands.default_permissions(administrator=True)
@@ -327,7 +378,7 @@ async def unlock_command(interaction: discord.Interaction):
     recent_joins.clear()
     await interaction.response.send_message("✅ 防衛モードを解除しました。通常通りメッセージを投稿できます。", ephemeral=True)
 
-@bot.tree.command(name="ipban", description="特定のユーザーをBANし、DBからIPを確認します")
+@bot.tree.command(name="ipban", description="特定のユーザーを手動でBANし、DBからIPを確認します")
 @app_commands.describe(user1="対象1", user2="対象2", user3="対象3")
 @app_commands.default_permissions(administrator=True)
 async def ipban_command(interaction: discord.Interaction, user1: discord.Member, user2: discord.Member = None, user3: discord.Member = None):
@@ -353,17 +404,15 @@ async def ipban_command(interaction: discord.Interaction, user1: discord.Member,
     await send_log(interaction.guild, "🔨 手動IPBAN実行", f"実行者: {interaction.user}\n対象者数: {len(banned_results)}人", color=0xFF0000)
 
 # --------------------------------------------------
-# メイン実行 (Flask と Discord Bot を同時に起動)
+# メイン実行
 # --------------------------------------------------
 if __name__ == "__main__":
     if not BOT_TOKEN:
         print("❌ エラー: BOT_TOKEN が設定されていません。")
     else:
-        # Flaskを別スレッドで起動してRenderのポート要件をクリアする
         flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False))
         flask_thread.daemon = True
         flask_thread.start()
         print(f"🌐 Flask サーバーをポート {PORT} で起動しました")
 
-        # Discord Bot 起動
         bot.run(BOT_TOKEN)
