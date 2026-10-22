@@ -2,14 +2,10 @@ import asyncio
 import json
 import os
 import datetime
-import re
-from threading import Thread
 
 import discord
 from discord import app_commands
-from discord.ext import commands, tasks
-import requests
-from bs4 import BeautifulSoup
+from discord.ext import commands
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -27,12 +23,7 @@ PROXY_URL = os.getenv("PROXY_URL")
 
 # 各種チャンネルID
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))         # 総合ログチャンネル
-SUMMARY_CHANNEL_ID = int(os.getenv("SUMMARY_CHANNEL_ID", "0")) # 拾った招待リンクを貼るチャンネル
-
-# 自動巡回する宣伝サイトやブログのURLリスト（ここに追加していけます）
-TARGET_URLS = [
-    "https://example-board.com/sample",  # サンプル（実際の巡回したいサイトのURLに書き換えてください）
-]
+SUMMARY_CHANNEL_ID = int(os.getenv("SUMMARY_CHANNEL_ID", "0")) # メンバーの招待リンク集約用チャンネル
 
 # 管理者・保護対象ユーザーのID設定
 auth_env = os.getenv("AUTHORIZED_USER_IDS", "")
@@ -42,7 +33,6 @@ else:
     AUTHORIZED_USER_IDS = {123456789012345678}
 
 message_spam_track = {}
-scraped_invites = set()  # 過去に発見したリンクの重複を防ぐセット
 
 # レイド防衛用の設定
 RAID_TIME_WINDOW = 10  
@@ -123,8 +113,6 @@ async def send_log(guild: discord.Guild, title: str, description: str, color=0x5
 # --------------------------------------------------
 class SecurityBot(commands.Bot):
     async def setup_hook(self):
-        # バックグラウンドタスク開始
-        self.web_scraper_loop.start()
         synced = await self.tree.sync()
         print(f"✅ スラッシュコマンド同期完了: {len(synced)} 件")
 
@@ -139,55 +127,8 @@ bot = SecurityBot(command_prefix="!", intents=intents, proxy=PROXY_URL)
 @bot.event
 async def on_ready():
     print("========================================")
-    print(f"✅ 要塞＆WebハンターBot 接続成功: {bot.user}")
+    print(f"✅ セキュリティ要塞Bot 接続成功: {bot.user}")
     print("========================================")
-
-# --------------------------------------------------
-# Webサイト巡回・招待リンク自動ハンター（バックグラウンドタスク）
-# --------------------------------------------------
-@tasks.loop(hours=1)  # 1時間に1回自動で巡回（必要に応じて分単位等に変更可能）
-async def web_scraper_loop():
-    if SUMMARY_CHANNEL_ID == 0 or not TARGET_URLS:
-        return
-
-    print("🔍 Webサイトの巡回＆招待リンク探索を開始します...")
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    
-    for url in TARGET_URLS:
-        try:
-            response = requests.get(url, headers=headers, timeout=10)
-            if response.status_code != 200:
-                continue
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            page_text = soup.get_text()
-            
-            # 正規表現でdiscordの招待コード/リンクを全て抽出
-            found_links = re.findall(r'(?:https?://)?(?:discord\.gg/|discord\.com/invite/)([a-zA-Z0-9_-]+)', page_text)
-            
-            for code in found_links:
-                invite_url = f"https://discord.gg/{code}"
-                if invite_url not in scraped_invites:
-                    scraped_invites.add(invite_url)
-                    
-                    # 転送先チャンネルへ送信
-                    for guild in bot.guilds:
-                        summary_channel = guild.get_channel(SUMMARY_CHANNEL_ID)
-                        if summary_channel:
-                            embed = discord.Embed(
-                                title="🌐 Web巡回で招待リンクを発見！",
-                                description=f"**巡回先サイト:** {url}\n\n🔗 **招待リンク:** {invite_url}",
-                                color=0x00FFCC,
-                                timestamp=datetime.datetime.now()
-                            )
-                            await summary_channel.send(embed=embed)
-                            
-        except Exception as e:
-            print(f"❌ 巡回エラー ({url}): {e}")
-
-@web_scraper_loop.before_loop
-async def before_web_scraper():
-    await bot.wait_until_ready()
 
 # --------------------------------------------------
 # メンバー参加時の防衛チェック
@@ -279,7 +220,7 @@ async def on_message(message: discord.Message):
     content = message.content
     user_id = author.id
 
-    # サーバー内でユーザーが投稿した宣伝リンクも自動集約する場合
+    # メンバーが投稿した宣伝・招待リンクを自動集約
     if SUMMARY_CHANNEL_ID != 0 and ("discord.gg/" in content or "discord.com/invite/" in content):
         if message.channel.id != SUMMARY_CHANNEL_ID:
             summary_channel = message.guild.get_channel(SUMMARY_CHANNEL_ID)
