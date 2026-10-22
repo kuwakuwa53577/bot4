@@ -1,21 +1,40 @@
 import asyncio
 import json
 import os
+import datetime
+import re
 from threading import Thread
+
 import discord
 from discord import app_commands
-from discord.ext import commands
-from flask import Flask
+from discord.ext import commands, tasks
+import requests
+from bs4 import BeautifulSoup
 
 import firebase_admin
 from firebase_admin import credentials, firestore
 
+import logging
+
+# ログ設定
+logging.basicConfig(level=logging.INFO)
+
 # --------------------------------------------------
-# 環境変数 & 設定
+# 設定 & 環境変数
 # --------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")
-PORT = int(os.getenv("PORT", 10000))
+PROXY_URL = os.getenv("PROXY_URL")
 
+# 各種チャンネルID
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))         # 総合ログチャンネル
+SUMMARY_CHANNEL_ID = int(os.getenv("SUMMARY_CHANNEL_ID", "0")) # 拾った招待リンクを貼るチャンネル
+
+# 自動巡回する宣伝サイトやブログのURLリスト（ここに追加していけます）
+TARGET_URLS = [
+    "https://example-board.com/sample",  # サンプル（実際の巡回したいサイトのURLに書き換えてください）
+]
+
+# 管理者・保護対象ユーザーのID設定
 auth_env = os.getenv("AUTHORIZED_USER_IDS", "")
 if auth_env:
     AUTHORIZED_USER_IDS = {int(uid.strip()) for uid in auth_env.split(",") if uid.strip().isdigit()}
@@ -23,6 +42,13 @@ else:
     AUTHORIZED_USER_IDS = {123456789012345678}
 
 message_spam_track = {}
+scraped_invites = set()  # 過去に発見したリンクの重複を防ぐセット
+
+# レイド防衛用の設定
+RAID_TIME_WINDOW = 10  
+RAID_JOIN_LIMIT = 5    
+recent_joins = []      
+is_raid_mode = False   
 
 # --------------------------------------------------
 # Firebase 初期化
@@ -52,6 +78,15 @@ except Exception as e:
     db = None
     print(f"⚠️ Firestoreクライアントの取得に失敗しました: {e}")
 
+def load_all_data():
+    if not db:
+        return {}
+    try:
+        docs = db.collection("verifications").stream()
+        return {doc.id: doc.to_dict() for doc in docs}
+    except Exception as e:
+        return {}
+
 def get_user_ip_from_db(user_id: int) -> str:
     if not db:
         return "データベース未接続"
@@ -59,50 +94,177 @@ def get_user_ip_from_db(user_id: int) -> str:
         doc_ref = db.collection("verifications").document(str(user_id))
         doc = doc_ref.get()
         if doc.exists:
-            data = doc.to_dict()
-            return data.get("ip", "IP未記録")
+            return doc.to_dict().get("ip", "IP未記録")
     except Exception as e:
-        print(f"❌ DB読み込みエラー: {e}")
+        pass
     return "IP取得失敗"
 
-# --------------------------------------------------
-# Flask サーバー（Renderのポート対策用）
-# --------------------------------------------------
-app = Flask(__name__)
+def is_authorized_or_admin(member: discord.Member) -> bool:
+    if not member:
+        return False
+    if member.id in AUTHORIZED_USER_IDS or member.guild_permissions.administrator:
+        return True
+    return False
 
-@app.route("/")
-@app.route("/ping")
-def ping():
-    return "Bot is running!", 200
+# ログ送信用ヘルパー関数
+async def send_log(guild: discord.Guild, title: str, description: str, color=0x5865F2):
+    if LOG_CHANNEL_ID == 0:
+        return
+    channel = guild.get_channel(LOG_CHANNEL_ID)
+    if channel:
+        embed = discord.Embed(title=title, description=description, color=color, timestamp=datetime.datetime.now())
+        try:
+            await channel.send(embed=embed)
+        except Exception as e:
+            print(f"❌ ログ送信エラー: {e}")
 
 # --------------------------------------------------
 # Discord Bot クラス
 # --------------------------------------------------
-class MyBot(commands.Bot):
+class SecurityBot(commands.Bot):
     async def setup_hook(self):
+        # バックグラウンドタスク開始
+        self.web_scraper_loop.start()
         synced = await self.tree.sync()
         print(f"✅ スラッシュコマンド同期完了: {len(synced)} 件")
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.guilds = True
+intents.moderation = True
 
-bot = MyBot(command_prefix="!", intents=intents)
+bot = SecurityBot(command_prefix="!", intents=intents, proxy=PROXY_URL)
 
 @bot.event
 async def on_ready():
     print("========================================")
-    print(f"✅ Discord Bot 接続成功: {bot.user}")
+    print(f"✅ 要塞＆WebハンターBot 接続成功: {bot.user}")
     print("========================================")
 
-def is_authorized_or_admin(member: discord.Member) -> bool:
-    if not member:
-        return False
-    if member.id in AUTHORIZED_USER_IDS:
-        return True
-    if member.guild_permissions.administrator:
-        return True
-    return False
+# --------------------------------------------------
+# Webサイト巡回・招待リンク自動ハンター（バックグラウンドタスク）
+# --------------------------------------------------
+@tasks.loop(hours=1)  # 1時間に1回自動で巡回（必要に応じて分単位等に変更可能）
+async def web_scraper_loop():
+    if SUMMARY_CHANNEL_ID == 0 or not TARGET_URLS:
+        return
+
+    print("🔍 Webサイトの巡回＆招待リンク探索を開始します...")
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    
+    for url in TARGET_URLS:
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code != 200:
+                continue
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            page_text = soup.get_text()
+            
+            # 正規表現でdiscordの招待コード/リンクを全て抽出
+            found_links = re.findall(r'(?:https?://)?(?:discord\.gg/|discord\.com/invite/)([a-zA-Z0-9_-]+)', page_text)
+            
+            for code in found_links:
+                invite_url = f"https://discord.gg/{code}"
+                if invite_url not in scraped_invites:
+                    scraped_invites.add(invite_url)
+                    
+                    # 転送先チャンネルへ送信
+                    for guild in bot.guilds:
+                        summary_channel = guild.get_channel(SUMMARY_CHANNEL_ID)
+                        if summary_channel:
+                            embed = discord.Embed(
+                                title="🌐 Web巡回で招待リンクを発見！",
+                                description=f"**巡回先サイト:** {url}\n\n🔗 **招待リンク:** {invite_url}",
+                                color=0x00FFCC,
+                                timestamp=datetime.datetime.now()
+                            )
+                            await summary_channel.send(embed=embed)
+                            
+        except Exception as e:
+            print(f"❌ 巡回エラー ({url}): {e}")
+
+@web_scraper_loop.before_loop
+async def before_web_scraper():
+    await bot.wait_until_ready()
+
+# --------------------------------------------------
+# メンバー参加時の防衛チェック
+# --------------------------------------------------
+@bot.event
+async def on_member_join(member: discord.Member):
+    global is_raid_mode, recent_joins
+    guild = member.guild
+    
+    # 1. アカウント作成日の確認（作りたて垢チェック：3日未満）
+    account_age_days = (datetime.datetime.now(datetime.timezone.utc) - member.created_at).days
+    if account_age_days < 3:
+        await send_log(
+            guild,
+            "⚠️【警戒】作りたてのアカウントが参加しました",
+            f"**ユーザー:** {member.mention} (`{member.id}`)\n**アカウント作成日:** {member.created_at.strftime('%Y-%m-%d')} ({account_age_days}日前)",
+            color=0xFFA500
+        )
+
+    # 2. IP重複・一致チェック
+    current_user_ip = get_user_ip_from_db(member.id)
+    if current_user_ip not in ["データベース未接続", "IP未記録", "IP取得失敗"]:
+        all_data = load_all_data()
+        for uid, info in all_data.items():
+            if int(uid) != member.id and info.get("ip") == current_user_ip:
+                other_username = info.get("username", "不明")
+                await send_log(
+                    guild,
+                    "🚨【重要警戒】同一IPのユーザーが入室しました！",
+                    f"**新規ユーザー:** {member.mention} (`{member.id}`)\n**一致した過去ユーザー:** {other_username} (ID: `{uid}`)\n**共通IP:** `{current_user_ip}`",
+                    color=0xFF0000
+                )
+                break
+
+    # 3. レイド検知
+    now = datetime.datetime.now()
+    recent_joins.append(now)
+    recent_joins = [t for t in recent_joins if (now - t).total_seconds() < RAID_TIME_WINDOW]
+    
+    if len(recent_joins) >= RAID_JOIN_LIMIT and not is_raid_mode:
+        is_raid_mode = True
+        try:
+            everyone_role = guild.default_role
+            for channel in guild.text_channels:
+                await channel.set_permissions(everyone_role, send_messages=False)
+        except Exception as e:
+            print(f"❌ 権限変更エラー: {e}")
+            
+        await send_log(
+            guild,
+            "🚨【緊急防衛発動】自爆ドローン（レイド攻撃）検知！",
+            f"短時間に {len(recent_joins)} 人の参加を検知したため、全チャットの送信権限を一時ロックしました。`/unlock` で解除できます。",
+            color=0xFF0000
+        )
+
+    await send_log(guild, "📥 メンバー入室", f"**{member}** (`{member.id}`) がサーバーに参加しました。")
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    await send_log(member.guild, "📤 メンバー退室", f"**{member}** (`{member.id}`) がサーバーから退出しました。", color=0x808080)
+
+# --------------------------------------------------
+# 各種ログ監視イベント（メッセージ・ロール・チャンネル）
+# --------------------------------------------------
+@bot.event
+async def on_message_delete(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
+    content = message.content if message.content else "[テキストなし/埋め込み等]"
+    if len(content) > 500:
+        content = content[:500] + "..."
+    await send_log(
+        message.guild,
+        "🗑️ メッセージ削除",
+        f"**送信者:** {message.author.mention}\n**チャンネル:** {message.channel.mention}\n**内容:** {content}",
+        color=0xF39C12
+    )
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -117,17 +279,30 @@ async def on_message(message: discord.Message):
     content = message.content
     user_id = author.id
 
-    # 1. @everyone 過剰
+    # サーバー内でユーザーが投稿した宣伝リンクも自動集約する場合
+    if SUMMARY_CHANNEL_ID != 0 and ("discord.gg/" in content or "discord.com/invite/" in content):
+        if message.channel.id != SUMMARY_CHANNEL_ID:
+            summary_channel = message.guild.get_channel(SUMMARY_CHANNEL_ID)
+            if summary_channel:
+                embed = discord.Embed(
+                    title="📢 メンバーからの招待リンク投稿を検知",
+                    description=f"**送信者:** {author.mention}\n**チャンネル:** {message.channel.mention}\n\n{content}",
+                    color=0x5865F2
+                )
+                await summary_channel.send(embed=embed)
+
+    # 1. @everyone 過剰検知
     everyone_count = content.count("@everyone") + content.count("@here")
     if everyone_count >= 5 or (len(message.raw_mentions) >= 5 and message.mention_everyone):
         try:
             ip = get_user_ip_from_db(user_id)
             await message.guild.ban(author, reason=f"荒らし対策: @everyone過剰 (IP: {ip})")
+            await send_log(message.guild, "🔨 自動BAN発動 (@everyone過剰)", f"**ユーザー:** {author} (`{user_id}`)\n**IP:** `{ip}`", color=0xFF0000)
             return
         except discord.Forbidden:
             pass
 
-    # 2. 同一メッセージ連投
+    # 2. 同一メッセージ連投検知
     stripped_content = content.strip()
     if user_id in message_spam_track:
         last_content, count = message_spam_track[user_id]
@@ -138,6 +313,7 @@ async def on_message(message: discord.Message):
                     ip = get_user_ip_from_db(user_id)
                     await message.guild.ban(author, reason=f"荒らし対策: 同一メッセージ連投 (IP: {ip})")
                     message_spam_track.pop(user_id, None)
+                    await send_log(message.guild, "🔨 自動BAN発動 (同一メッセージ連投)", f"**ユーザー:** {author} (`{user_id}`)\n**IP:** `{ip}`", color=0xFF0000)
                     return
                 except discord.Forbidden:
                     pass
@@ -148,22 +324,57 @@ async def on_message(message: discord.Message):
     else:
         message_spam_track[user_id] = [stripped_content, 1]
 
-    # 3. 5行以上長文
-    lines = content.splitlines()
-    if len(lines) >= 5:
+    # 3. 5行以上長文検知
+    if len(content.splitlines()) >= 5:
         try:
             ip = get_user_ip_from_db(user_id)
             await message.guild.ban(author, reason=f"荒らし対策: 5行以上長文 (IP: {ip})")
+            await send_log(message.guild, "🔨 自動BAN発動 (5行以上長文)", f"**ユーザー:** {author} (`{user_id}`)\n**IP:** `{ip}`", color=0xFF0000)
             return
         except discord.Forbidden:
             pass
 
     await bot.process_commands(message)
 
-@bot.tree.command(name="ipban", description="特定のユーザーを複数選択してBANし、DBからIPを確認します")
+# チャンネル・ロール・ボット導入の各種ログイベント
+@bot.event
+async def on_guild_channel_create(channel):
+    await send_log(channel.guild, "➕ チャンネル作成", f"チャンネル **{channel.name}** ({channel.type}) が作成されました。")
+
+@bot.event
+async def on_guild_channel_delete(channel):
+    await send_log(channel.guild, "❌ チャンネル削除", f"チャンネル **{channel.name}** が削除されました。", color=0xFF0000)
+
+@bot.event
+async def on_guild_role_create(role):
+    await send_log(role.guild, "🛡️ ロール作成", f"ロール **{role.name}** が作成されました。")
+
+@bot.event
+async def on_guild_role_delete(role):
+    await send_log(role.guild, "🛡️ ロール削除", f"ロール **{role.name}** が削除されました。", color=0xFF0000)
+
+@bot.event
+async def on_member_update(before, after):
+    if not before.bot and after.bot:
+        await send_log(after.guild, "🤖 ボット導入", f"新しいボット **{after.mention}** がサーバーに追加されました。")
+
+# --------------------------------------------------
+# スラッシュコマンド
+# --------------------------------------------------
+@bot.tree.command(name="unlock", description="レイド防衛モードを解除し、チャンネルの書き込みを再開します")
+@app_commands.default_permissions(administrator=True)
+async def unlock_command(interaction: discord.Interaction):
+    global is_raid_mode, recent_joins
+    guild = interaction.guild
+    for channel in guild.text_channels:
+        await channel.set_permissions(guild.default_role, send_messages=None)
+    is_raid_mode = False
+    recent_joins.clear()
+    await interaction.response.send_message("✅ 防衛モードを解除しました。", ephemeral=True)
+
+@bot.tree.command(name="ipban", description="特定のユーザーをBANし、DBからIPを確認します")
 @app_commands.describe(user1="対象1", user2="対象2", user3="対象3")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.default_permissions(administrator=True)
 async def ipban_command(interaction: discord.Interaction, user1: discord.Member, user2: discord.Member = None, user3: discord.Member = None):
     if not is_authorized_or_admin(interaction.user):
         await interaction.response.send_message("❌ 権限がありません。", ephemeral=True)
@@ -171,40 +382,26 @@ async def ipban_command(interaction: discord.Interaction, user1: discord.Member,
 
     targets = [u for u in [user1, user2, user3] if u is not None]
     banned_results = []
-    failed_list = []
-
+    
     for target in targets:
         if is_authorized_or_admin(target):
-            failed_list.append(f"{target.name} (保護対象)")
             continue
-        
         ip = get_user_ip_from_db(target.id)
         try:
             await interaction.guild.ban(target, reason=f"IP/ID BAN実行: {interaction.user} (IP: {ip})")
             banned_results.append(f"・**{target.name}** (IP: `{ip}`)")
         except Exception as e:
-            failed_list.append(f"{target.name} (エラー: {e})")
+            pass
 
-    result_msg = "🔨 **IP/ID BAN 処理結果**\n"
-    if banned_results:
-        result_msg += "\n".join(banned_results) + "\n"
-    if failed_list:
-        result_msg += f"\n⚠️ 失敗/スキップ: {', '.join(failed_list)}"
-
+    result_msg = "🔨 **IP/ID BAN 処理完了**\n" + "\n".join(banned_results)
     await interaction.response.send_message(result_msg, ephemeral=True)
+    await send_log(interaction.guild, "🔨 手動IPBAN実行", f"実行者: {interaction.user}\n対象者数: {len(banned_results)}人", color=0xFF0000)
 
 # --------------------------------------------------
-# メイン実行 (Flask と Discord Bot を同時に起動)
+# メイン実行
 # --------------------------------------------------
 if __name__ == "__main__":
     if not BOT_TOKEN:
         print("❌ エラー: BOT_TOKEN が設定されていません。")
     else:
-        # Flaskを別スレッドで起動（Renderのポート監視をパスするため）
-        flask_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False))
-        flask_thread.daemon = True
-        flask_thread.start()
-        print(f"🌐 Flask サーバーをポート {PORT} で起動しました")
-
-        # Discord Bot 起動
         bot.run(BOT_TOKEN)
