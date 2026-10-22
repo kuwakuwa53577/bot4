@@ -28,7 +28,7 @@ PORT = int(os.getenv("PORT", 10000)) # Render用のポート
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))         # 総合ログチャンネル
 SUMMARY_CHANNEL_ID = int(os.getenv("SUMMARY_CHANNEL_ID", "0")) # メンバーの招待リンク集約用チャンネル
 EXECUTION_CHANNEL_ID = int(os.getenv("EXECUTION_CHANNEL_ID", "0")) # 公開処刑・監獄チャンネルID
-JAIL_ROLE_ID = int(os.getenv("JAIL_ROLE_ID", "0"))             # ★監獄ロールID
+JAIL_ROLE_ID = int(os.getenv("JAIL_ROLE_ID", "0"))             # 監獄ロールID
 
 # 管理者・保護対象ユーザーのID設定
 auth_env = os.getenv("AUTHORIZED_USER_IDS", "")
@@ -195,7 +195,6 @@ async def on_member_join(member: discord.Member):
     global is_raid_mode, recent_joins
     guild = member.guild
     
-    # すでに監獄リストにいる人が再入室した場合、自動で再び監獄ロールを付与
     if is_user_jailed(member.id) and JAIL_ROLE_ID != 0:
         jail_role = guild.get_role(JAIL_ROLE_ID)
         if jail_role:
@@ -204,7 +203,6 @@ async def on_member_join(member: discord.Member):
             except Exception:
                 pass
 
-    # 1. アカウント作成日の確認（3日未満）
     account_age_days = (datetime.datetime.now(datetime.timezone.utc) - member.created_at).days
     if account_age_days < 3:
         await send_log(
@@ -214,7 +212,6 @@ async def on_member_join(member: discord.Member):
             color=0xFFA500
         )
 
-    # 2. IP重複・一致チェック
     current_user_ip = get_user_ip_from_db(member.id)
     if current_user_ip not in ["データベース未接続", "IP未記録", "IP取得失敗"]:
         all_data = load_all_data()
@@ -229,7 +226,6 @@ async def on_member_join(member: discord.Member):
                 )
                 break
 
-    # 3. レイド検知
     now = datetime.datetime.now()
     recent_joins.append(now)
     recent_joins = [t for t in recent_joins if (now - t).total_seconds() < RAID_TIME_WINDOW]
@@ -250,43 +246,33 @@ async def on_member_remove(member: discord.Member):
     await send_log(member.guild, "📤 メンバー退室", f"**{member}** (`{member.id}`) がサーバーから退出しました。", color=0x808080)
 
 # --------------------------------------------------
-# メッセージ監視 & 自動監獄送り関数
+# メッセージ監視 & 監獄送り共通処理
 # --------------------------------------------------
-async def process_jail_target(message: discord.Message, reason: str):
-    author = message.author
-    user_id = author.id
-    guild = message.guild
-    
+async def process_jail_target(guild: discord.Guild, member: discord.Member, reason: str, last_message: str = "なし"):
+    user_id = member.id
     ip = get_user_ip_from_db(user_id)
-    content = message.content[:100]
 
     if db:
         try:
             db.collection("jail_list").document(str(user_id)).set({
-                "username": str(author),
+                "username": str(member),
                 "ip": ip,
                 "reason": reason,
-                "last_message": content,
+                "last_message": last_message,
                 "jailed_at": firestore.SERVER_TIMESTAMP
             })
         except Exception as e:
             print(f"❌ 監獄登録エラー: {e}")
 
-    # 監獄ロールを付与して完全に隔離
-    if JAIL_ROLE_ID != 0 and isinstance(author, discord.Member):
+    if JAIL_ROLE_ID != 0:
         jail_role = guild.get_role(JAIL_ROLE_ID)
         if jail_role:
             try:
-                await author.add_roles(jail_role, reason=f"自動監獄送り: {reason}")
+                await member.add_roles(jail_role, reason=f"監獄送り: {reason}")
             except Exception:
                 pass
 
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-    await send_log(guild, f"🔒 自動監獄送り ({reason})", f"**ユーザー:** {author.mention} (`{user_id}`)\n**IP:** `{ip}`", color=0xFF0000)
+    await send_log(guild, f"🔒 監獄送り実行 ({reason})", f"**ユーザー:** {member.mention} (`{user_id}`)\n**IP:** `{ip}`", color=0xFF0000)
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -300,7 +286,6 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    # すでに監獄にいるユーザーのメッセージは完全抹消
     if is_user_jailed(user_id):
         try:
             await message.delete()
@@ -318,7 +303,6 @@ async def on_message(message: discord.Message):
 
     content = message.content
 
-    # 招待リンク集約
     if SUMMARY_CHANNEL_ID != 0 and ("discord.gg/" in content or "discord.com/invite/" in content):
         if message.channel.id != SUMMARY_CHANNEL_ID:
             summary_channel = message.guild.get_channel(SUMMARY_CHANNEL_ID)
@@ -333,7 +317,11 @@ async def on_message(message: discord.Message):
     # 1. @everyone 過剰検知
     everyone_count = content.count("@everyone") + content.count("@here")
     if everyone_count >= 5 or (len(message.raw_mentions) >= 5 and message.mention_everyone):
-        await process_jail_target(message, "@everyone過剰スパム")
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await process_jail_target(message.guild, author, "@everyone過剰スパム", content[:100])
         return
 
     # 2. 同一メッセージ連投検知
@@ -344,7 +332,11 @@ async def on_message(message: discord.Message):
             count += 1
             if count >= 4:
                 message_spam_track.pop(user_id, None)
-                await process_jail_target(message, "同一メッセージ連投スパム")
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
+                await process_jail_target(message.guild, author, "同一メッセージ連投スパム", stripped_content[:100])
                 return
             else:
                 message_spam_track[user_id] = [stripped_content, count]
@@ -355,7 +347,11 @@ async def on_message(message: discord.Message):
 
     # 3. 5行以上長文検知
     if len(content.splitlines()) >= 5:
-        await process_jail_target(message, "5行以上の長文スパム")
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await process_jail_target(message.guild, author, "5行以上の長文スパム", content[:100])
         return
 
     await bot.process_commands(message)
@@ -370,6 +366,21 @@ async def unlock_command(interaction: discord.Interaction):
     is_raid_mode = False
     recent_joins.clear()
     await interaction.response.send_message("✅ 防衛モードを解除しました。", ephemeral=True)
+
+@bot.tree.command(name="jail", description="指定したユーザーを手動で監獄送り＆公開処刑リストに追加します")
+@app_commands.describe(user="処刑対象のユーザー", reason="理由（任意）")
+@app_commands.default_permissions(administrator=True)
+async def manual_jail_command(interaction: discord.Interaction, user: discord.Member, reason: str = "管理者による手動制裁"):
+    if not is_authorized_or_admin(interaction.user):
+        await interaction.response.send_message("❌ 権限がありません。", ephemeral=True)
+        return
+
+    if is_authorized_or_admin(user):
+        await interaction.response.send_message("❌ 管理者や保護対象ユーザーを監獄送りにすることはできません。", ephemeral=True)
+        return
+
+    await process_jail_target(interaction.guild, user, reason, "手動命令による収監")
+    await interaction.response.send_message(f"🔒 ユーザー {user.mention} を監獄送り（公開処刑対象）に指定しました！", ephemeral=True)
 
 @bot.tree.command(name="unjail", description="指定したユーザーを監獄から解放し、ロールを外します")
 @app_commands.describe(user="解放したいユーザー")
@@ -390,7 +401,6 @@ async def unjail_command(interaction: discord.Interaction, user: discord.Member)
     if doc.exists:
         doc_ref.delete()
         
-        # 監獄ロールを剥奪
         if JAIL_ROLE_ID != 0:
             jail_role = interaction.guild.get_role(JAIL_ROLE_ID)
             if jail_role and jail_role in user.roles:
