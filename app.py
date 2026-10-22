@@ -183,17 +183,10 @@ async def on_member_join(member: discord.Member):
     
     if len(recent_joins) >= RAID_JOIN_LIMIT and not is_raid_mode:
         is_raid_mode = True
-        try:
-            everyone_role = guild.default_role
-            for channel in guild.text_channels:
-                await channel.set_permissions(everyone_role, send_messages=False)
-        except Exception as e:
-            print(f"❌ 権限変更エラー: {e}")
-            
         await send_log(
             guild,
             "🚨【緊急防衛発動】自爆ドローン（レイド攻撃）検知！",
-            f"短時間に {len(recent_joins)} 人の参加を検知したため、全チャットの送信権限を一時ロックしました。`/unlock` で解除できます。",
+            f"短時間に {len(recent_joins)} 人の参加を検知したため、防衛モード（メッセージ自動削除）を有効化しました。`/unlock` で解除できます。",
             color=0xFF0000
         )
 
@@ -226,8 +219,19 @@ async def on_message(message: discord.Message):
         return
 
     author = message.author
+    
+    # 管理者や権限持ちは防衛モード中でもスルーして通常処理へ
     if isinstance(author, discord.Member) and is_authorized_or_admin(author):
         await bot.process_commands(message)
+        return
+
+    # 防衛モード中の場合はチャンネル権限をいじらずにメッセージを自動削除
+    global is_raid_mode
+    if is_raid_mode:
+        try:
+            await message.delete()
+        except Exception:
+            pass
         return
 
     content = message.content
@@ -315,16 +319,13 @@ async def on_member_update(before, after):
 # --------------------------------------------------
 # スラッシュコマンド
 # --------------------------------------------------
-@bot.tree.command(name="unlock", description="レイド防衛モードを解除し、チャンネルの書き込みを再開します")
+@bot.tree.command(name="unlock", description="レイド防衛モードを解除し、通常の状態に戻します")
 @app_commands.default_permissions(administrator=True)
 async def unlock_command(interaction: discord.Interaction):
     global is_raid_mode, recent_joins
-    guild = interaction.guild
-    for channel in guild.text_channels:
-        await channel.set_permissions(guild.default_role, send_messages=None)
     is_raid_mode = False
     recent_joins.clear()
-    await interaction.response.send_message("✅ 防衛モードを解除しました。", ephemeral=True)
+    await interaction.response.send_message("✅ 防衛モードを解除しました。通常通りメッセージを投稿できます。", ephemeral=True)
 
 @bot.tree.command(name="ipban", description="特定のユーザーをBANし、DBからIPを確認します")
 @app_commands.describe(user1="対象1", user2="対象2", user3="対象3")
